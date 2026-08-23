@@ -20,11 +20,17 @@ ShowTrayBackgroundWindows := false
 ; 后台窗口按 MRU 排序后置底（false 表示和前台窗口一起按 MRU 排序）
 BackgroundWindowsAlwaysAtBottom := true
 
+; 窗口预览时是否隐藏其它普通窗口，仅保留箭头指向窗口和桌面背景
+PreviewOnlySelectedWindow := false
+
 ; UI 字体大小
 UIFontSize := 18
 
 ; UI 行间距
 UIRowGap := 8
+
+; UI 进程图标大小（像素）
+UIIconSize := 24
 
 ; 第二列程序名最大列宽（像素）
 MaxProcessColumnWidth := 300
@@ -36,6 +42,11 @@ TitleColumnWidth := 380
 ProcessAliasMap := Map(
     "voicemeeterpro_x64",   "VoiceMeeter",
     "Code",                 "VSCode",
+    "SteamWebHelper",       "Steam",
+    "Explorer",             "文件夹",
+    "ChatGPT",              "GPT",
+    "RainbowSix",           "R6",
+    "Editor",               "EQ APO",
 )
 
 ; 是否启用 Alt+数字快捷启动
@@ -63,6 +74,16 @@ Blacklist := [
     "PowerDimmer.exe",
     "SpookyView_1.1.0_x64_Portable.exe",
     "AutoHotkey64.exe",
+]
+
+; 白名单 — 即使未曾作为前台窗口记录，也允许作为后台窗口列入
+BackgroundProcessAllowlist := [
+    "HeSuVi.exe",
+]
+
+; 白名单 — 允许 owned window 作为真实应用窗口列入
+OwnedWindowProcessAllowlist := [
+    "HeSuVi.exe",
 ]
 
 ; 黑名单 — 不作为应用主窗口处理的辅助窗口类
@@ -94,6 +115,12 @@ ClassPrefixBlacklist := [
     "WindowsForms10.Window.808.app.0.5c39d4",
 ]
 
+; ; 自定义快捷键，Ctrl+Shift+S 关屏幕
+; ^+s::
+; {
+;     DllCall("SendMessage", "ptr", 0xFFFF, "uint", 0x0112, "ptr", 0xF170, "ptr", 2)
+; }
+
 ; =====================================================
 ; 全局状态
 ; =====================================================
@@ -101,16 +128,23 @@ ClassPrefixBlacklist := [
 WindowHistory := []          ; 窗口 HWND 列表（MRU 顺序：索引 1 为最近）
 ForegroundProcessSeen := Map() ; 曾经作为前台窗口出现过的进程
 DisplayWindows := []         ; 当前 UI 实际显示的 HWND 列表
+DisplayWindowWasBackground := Map() ; 切换开始时每个 UI 窗口是否为后台/最小化
 Switching := false           ; 是否正在切换中
 Index := 1                   ; 当前选中序号
 GuiObj := ""                 ; GUI 对象引用
 ForegroundProcessControls := [] ; GUI 前台进程名控件列表
 BackgroundProcessControls := [] ; GUI 后台进程名控件列表
+IconControls := []           ; GUI 进程图标控件列表
 TitleControls := []          ; GUI 标题控件列表
 ArrowControls := []          ; GUI 箭头控件列表
 QuickProgramLastHwnd := Map() ; Alt+数字 多窗口轮转位置
 QuickProgramWindowOrder := Map() ; Alt+数字 每个程序的稳定窗口顺序
 QuickProgramHistoryFocus := Map() ; Alt+数字 激活后，同进程只保留目标窗口进入 Alt+Tab 队列
+QuickProgramShortcutCache := Map() ; exe 名 -> 开始菜单快捷方式路径
+PreviewZOrder := []            ; 进入 Alt+Tab 时普通窗口 Z 序快照
+PreviewTransparentWindows := Map() ; 预览独占模式下被临时透明的窗口
+PreviewShownMinimizedWindows := Map() ; 预览时被临时无激活显示的最小化窗口
+PreviewCurrentHwnd := 0        ; 当前预览窗口
 
 ; =====================================================
 ; 窗口枚举 — WinAPI EnumWindows
@@ -275,7 +309,7 @@ IsAltTabCandidate(hwnd, allowBackground := false)
     hasAppWindow := (exStyle & 0x40000) != 0
     hasNoActivate := (exStyle & 0x08000000) != 0
     owner := DllCall("user32\GetWindow", "ptr", hwnd, "uint", 4, "ptr") ; GW_OWNER
-    if (!isSeenTrayWindow && ((hasToolWindow && !hasAppWindow) || hasNoActivate || (owner && !hasAppWindow)))
+    if (!isSeenTrayWindow && ((hasToolWindow && !hasAppWindow) || hasNoActivate || (owner && !hasAppWindow && !IsOwnedWindowProcessAllowed(hwnd))))
         return false
 
     try
@@ -409,9 +443,11 @@ KeepOnlyProgramWindowInHistory(exeName, keepHwnd)
 StartSwitching(step := 1)
 {
     global Switching, Index, DisplayWindows
-    ; 进入冻结状态前先刷新一次，确保列表拿到最新活动窗口
-    UpdateWindowHistory()
-    DisplayWindows := GetDisplayWindows()
+    ; 热键路径只同步处理当前前台窗口，避免全量枚举阻塞首帧 UI。
+    CaptureActiveWindowForSwitching()
+    RemoveClosedWindowsFromHistory()
+    DisplayWindows := GetDisplayWindows(false)
+    CaptureDisplayWindowStates()
     Switching := true
     count := DisplayWindows.Length
     if (count <= 1)
@@ -450,12 +486,15 @@ MoveSelection(step)
 ; 统一结束切换流程，避免热键和定时器各自维护状态
 FinishSwitching()
 {
-    global Switching
+    global Switching, DisplayWindows, DisplayWindowWasBackground, Index
     if (!Switching)
         return
 
+    selectedHwnd := (Index >= 1 && Index <= DisplayWindows.Length) ? DisplayWindows[Index] : 0
+    RestoreWindowPreview(selectedHwnd)
     ActivateSelected()
     Switching := false
+    DisplayWindowWasBackground := Map()
     HideList()
     SetTimer(PreCreateListGui, -50)
 }
@@ -472,7 +511,7 @@ ShowList()
 ; 更新 GUI 三列内容：箭头、程序名、标题
 RefreshList()
 {
-    global GuiObj, ForegroundProcessControls, BackgroundProcessControls, TitleControls, ArrowControls, DisplayWindows, Index, Switching
+    global GuiObj, ForegroundProcessControls, BackgroundProcessControls, IconControls, TitleControls, ArrowControls, DisplayWindows, Index, Switching
 
     Critical "On"
     if (!IsListGuiReady())
@@ -480,8 +519,14 @@ RefreshList()
     if (!IsListGuiReady())
         return
 
-    RemoveInvalidWindows()
-    DisplayWindows := GetDisplayWindows()
+    if (Switching)
+        PruneDisplayWindows()
+    else
+    {
+        RemoveInvalidWindows()
+        DisplayWindows := GetDisplayWindows()
+        CaptureDisplayWindowStates()
+    }
     maxRows := GetMaxDisplayWindows()
     count := DisplayWindows.Length
     if (Index > count)
@@ -494,6 +539,7 @@ RefreshList()
     {
         foregroundProcessCtrl := ForegroundProcessControls[A_Index]
         backgroundProcessCtrl := BackgroundProcessControls[A_Index]
+        iconCtrl := IconControls[A_Index]
         titleCtrl := TitleControls[A_Index]
         arrowCtrl := ArrowControls[A_Index]
         if (A_Index > count)
@@ -505,6 +551,8 @@ RefreshList()
             foregroundProcessCtrl.Opt("+Hidden")
             backgroundProcessCtrl.Text := ""
             backgroundProcessCtrl.Opt("+Hidden")
+            iconCtrl.Value := ""
+            iconCtrl.Opt("+Hidden")
             titleCtrl.Text := ""
             titleCtrl.Opt("+Hidden")
             continue
@@ -525,9 +573,12 @@ RefreshList()
 
         arrowCtrl.Text := (A_Index = Index) ? "▶" : ""
         arrowCtrl.Opt("-Hidden")
+        iconPath := GetWindowIconPath(hwnd)
+        UpdateIconControl(iconCtrl, iconPath)
         processText := FormatProcessName(exe)
         processFontSize := (A_Index = 1) ? Max(1, UIFontSize - 3) : UIFontSize
-        if (IsBackgroundWindow(hwnd))
+        isBackgroundDisplay := IsDisplayWindowBackground(hwnd)
+        if (isBackgroundDisplay)
         {
             processDisplayText := "__" processText
             backgroundProcessCtrl.Text := processDisplayText
@@ -547,7 +598,7 @@ RefreshList()
         titleCtrl.Text := titleDisplayText
         titleCtrl.Opt("-Hidden")
 
-        measuredWidth := MeasureDisplayTextWidth(processDisplayText, processFontSize, IsBackgroundWindow(hwnd)) + 12
+        measuredWidth := MeasureDisplayTextWidth(processDisplayText, processFontSize, isBackgroundDisplay) + 12
         maxProcessWidth := Max(maxProcessWidth, measuredWidth)
     }
 
@@ -572,13 +623,44 @@ RefreshList()
             FinishSwitching()
         else
             HideList()
+        return
+    }
+
+    ApplyWindowPreview()
+    RestoreListTopmost(true)
+}
+
+CaptureActiveWindowForSwitching()
+{
+    activeHwnd := WinExist("A")
+    if (!activeHwnd)
+        return
+
+    if (IsAltTabCandidate(activeHwnd, false))
+    {
+        MarkForegroundProcessSeen(activeHwnd)
+        UpdateQuickProgramHistoryFocus(activeHwnd)
+        PromoteWindow(activeHwnd)
+    }
+}
+
+RemoveClosedWindowsFromHistory()
+{
+    global WindowHistory
+
+    i := WindowHistory.Length
+    while (i >= 1)
+    {
+        if (!WinExist("ahk_id " WindowHistory[i]))
+            WindowHistory.RemoveAt(i)
+        i--
     }
 }
 
 ; 按当前内容宽度排列第二、第三列，第二列不超过上限
 ApplyListColumnWidths(processWidth := 0)
 {
-    global ForegroundProcessControls, BackgroundProcessControls, TitleControls, MaxProcessColumnWidth, TitleColumnWidth
+    global ForegroundProcessControls, BackgroundProcessControls, TitleControls, MaxProcessColumnWidth, TitleColumnWidth, UIIconSize
 
     if (!IsListGuiReady())
         return
@@ -587,14 +669,341 @@ ApplyListColumnWidths(processWidth := 0)
         processWidth := MaxProcessColumnWidth
     processWidth := Min(processWidth, MaxProcessColumnWidth)
     titleWidth := TitleColumnWidth
-    titleX := 52 + processWidth
+    processX := GetProcessColumnX()
+    titleX := processX + processWidth
 
     Loop GetMaxDisplayWindows()
     {
-        ForegroundProcessControls[A_Index].Move(, , processWidth)
-        BackgroundProcessControls[A_Index].Move(, , processWidth)
+        ForegroundProcessControls[A_Index].Move(processX, , processWidth)
+        BackgroundProcessControls[A_Index].Move(processX, , processWidth)
         TitleControls[A_Index].Move(titleX, , titleWidth)
     }
+}
+
+GetIconColumnX()
+{
+    return 40
+}
+
+GetProcessColumnX()
+{
+    global UIIconSize
+    return GetIconColumnX() + UIIconSize + 8
+}
+
+GetWindowIconPath(hwnd)
+{
+    try
+    {
+        path := WinGetProcessPath("ahk_id " hwnd)
+        if (path != "" && FileExist(path))
+            return path
+    }
+    catch
+        return ""
+
+    return ""
+}
+
+UpdateIconControl(iconCtrl, iconPath)
+{
+    global UIIconSize
+
+    if (iconPath = "")
+    {
+        iconCtrl.Value := ""
+        iconCtrl.Opt("+Hidden")
+        return
+    }
+
+    try
+    {
+        iconCtrl.Move(, , UIIconSize, UIIconSize)
+        iconCtrl.Value := "*w" UIIconSize " *h" UIIconSize " " iconPath
+        iconCtrl.Opt("-Hidden")
+    }
+    catch
+    {
+        try
+        {
+            iconCtrl.Value := ""
+            iconCtrl.Opt("+Hidden")
+        }
+    }
+}
+
+; 切换开始时冻结每一行的后台/最小化标记，避免预览恢复窗口后 UI 分组跳动。
+CaptureDisplayWindowStates()
+{
+    global DisplayWindows, DisplayWindowWasBackground
+
+    DisplayWindowWasBackground := Map()
+    for hwnd in DisplayWindows
+        DisplayWindowWasBackground[hwnd] := IsBackgroundWindow(hwnd)
+}
+
+IsDisplayWindowBackground(hwnd)
+{
+    global Switching, DisplayWindowWasBackground
+
+    if (Switching && DisplayWindowWasBackground.Has(hwnd))
+        return DisplayWindowWasBackground[hwnd]
+    return IsBackgroundWindow(hwnd)
+}
+
+; 切换期间只清理已关闭窗口，不重建列表，避免预览激活最小化窗口后被数量限制挤出。
+PruneDisplayWindows()
+{
+    global DisplayWindows
+
+    i := DisplayWindows.Length
+    while (i >= 1)
+    {
+        hwnd := DisplayWindows[i]
+        if (!WinExist("ahk_id " hwnd))
+            DisplayWindows.RemoveAt(i)
+        i--
+    }
+}
+
+; 记录切换开始时普通窗口的 Z 序，结束前恢复，避免预览过程永久改变其它窗口排列
+CapturePreviewZOrder()
+{
+    global PreviewZOrder, PreviewTransparentWindows, PreviewShownMinimizedWindows, PreviewCurrentHwnd
+
+    PreviewZOrder := []
+    PreviewTransparentWindows := Map()
+    PreviewShownMinimizedWindows := Map()
+    PreviewCurrentHwnd := 0
+
+    for hwnd in EnumWindowsRaw()
+    {
+        if (IsPreviewManagedWindow(hwnd, true))
+            PreviewZOrder.Push(hwnd)
+    }
+}
+
+; 将箭头指向窗口展示出来。先无激活抬高，再实际激活，确保窗口可见。
+ApplyWindowPreview()
+{
+    global DisplayWindows, Index, PreviewOnlySelectedWindow, PreviewCurrentHwnd, PreviewZOrder
+
+    if (Index < 1 || Index > DisplayWindows.Length)
+        return
+
+    hwnd := DisplayWindows[Index]
+    if (!WinExist("ahk_id " hwnd))
+        return
+
+    if (PreviewZOrder.Length = 0)
+        CapturePreviewZOrder()
+
+    if (PreviewOnlySelectedWindow)
+        ApplyPreviewOnlyMode(hwnd)
+    else
+        RestorePreviewTransparency(hwnd)
+
+    ShowPreviewWindow(hwnd)
+    ActivatePreviewWindow(hwnd)
+    PreviewCurrentHwnd := hwnd
+}
+
+; 独占预览：其它普通窗口透明，让桌面成为背景。置顶/贴图/工具窗不处理。
+ApplyPreviewOnlyMode(selectedHwnd)
+{
+    global PreviewTransparentWindows
+
+    for hwnd in EnumWindowsRaw()
+    {
+        if (hwnd = selectedHwnd)
+            continue
+        if (!IsPreviewManagedWindow(hwnd, false))
+            continue
+        if (!PreviewTransparentWindows.Has(hwnd))
+        {
+            try
+                PreviewTransparentWindows[hwnd] := WinGetTransparent("ahk_id " hwnd)
+            catch
+                PreviewTransparentWindows[hwnd] := ""
+        }
+        try
+            WinSetTransparent(0, "ahk_id " hwnd)
+    }
+
+    RestoreOnePreviewTransparency(selectedHwnd)
+}
+
+; 关闭独占模式或选中某个曾被透明化的窗口时，恢复透明度。
+RestorePreviewTransparency(exceptHwnd := 0)
+{
+    global PreviewTransparentWindows
+
+    for hwnd, originalTransparency in PreviewTransparentWindows.Clone()
+    {
+        if (hwnd = exceptHwnd)
+            continue
+        if (WinExist("ahk_id " hwnd))
+        {
+            try
+            {
+                if (originalTransparency = "")
+                    WinSetTransparent("Off", "ahk_id " hwnd)
+                else
+                    WinSetTransparent(originalTransparency, "ahk_id " hwnd)
+            }
+        }
+        PreviewTransparentWindows.Delete(hwnd)
+    }
+}
+
+RestoreOnePreviewTransparency(hwnd)
+{
+    global PreviewTransparentWindows
+
+    if (!PreviewTransparentWindows.Has(hwnd))
+        return
+
+    originalTransparency := PreviewTransparentWindows[hwnd]
+    if (WinExist("ahk_id " hwnd))
+    {
+        try
+        {
+            if (originalTransparency = "")
+                WinSetTransparent("Off", "ahk_id " hwnd)
+            else
+                WinSetTransparent(originalTransparency, "ahk_id " hwnd)
+        }
+    }
+    PreviewTransparentWindows.Delete(hwnd)
+}
+
+; 尽量不激活地先展示候选窗口，后续再实际激活兜底。
+ShowPreviewWindow(hwnd)
+{
+    global PreviewShownMinimizedWindows
+
+    if (IsWindowPreviewProtected(hwnd))
+        return
+
+    visible := DllCall("user32\IsWindowVisible", "ptr", hwnd)
+    iconic := DllCall("user32\IsIconic", "ptr", hwnd)
+    if (!visible && !iconic)
+        return
+
+    if (iconic)
+    {
+        if (!PreviewShownMinimizedWindows.Has(hwnd))
+            PreviewShownMinimizedWindows[hwnd] := true
+        DllCall("user32\ShowWindow", "ptr", hwnd, "int", 4) ; SW_SHOWNOACTIVATE
+    }
+
+    ; HWND_TOP=0；0x13 = NOSIZE | NOMOVE | NOACTIVATE
+    DllCall("user32\SetWindowPos"
+        , "ptr", hwnd
+        , "ptr", 0
+        , "int", 0
+        , "int", 0
+        , "int", 0
+        , "int", 0
+        , "uint", 0x13)
+}
+
+; 实际激活候选窗口，保证箭头移动时用户能看到该窗口。
+ActivatePreviewWindow(hwnd)
+{
+    global PreviewCurrentHwnd
+
+    if (hwnd = PreviewCurrentHwnd)
+        return
+    if (IsWindowPreviewProtected(hwnd))
+        return
+
+    visible := DllCall("user32\IsWindowVisible", "ptr", hwnd)
+    iconic := DllCall("user32\IsIconic", "ptr", hwnd)
+    if (!visible && !iconic)
+        return
+
+    try
+    {
+        if (iconic)
+            DllCall("user32\ShowWindow", "ptr", hwnd, "int", 9) ; SW_RESTORE
+        WinActivate("ahk_id " hwnd)
+    }
+}
+
+; 恢复预览造成的透明、最小化和普通窗口 Z 序。最终选中的窗口交给 ActivateWindow 处理。
+RestoreWindowPreview(exceptHwnd := 0)
+{
+    global PreviewZOrder, PreviewShownMinimizedWindows, PreviewCurrentHwnd
+
+    RestorePreviewTransparency(exceptHwnd)
+
+    for hwnd, _ in PreviewShownMinimizedWindows.Clone()
+    {
+        if (hwnd = exceptHwnd)
+            continue
+        if (WinExist("ahk_id " hwnd))
+        {
+            try
+                DllCall("user32\ShowWindow", "ptr", hwnd, "int", 6) ; SW_MINIMIZE
+        }
+        PreviewShownMinimizedWindows.Delete(hwnd)
+    }
+
+    i := PreviewZOrder.Length
+    while (i >= 1)
+    {
+        hwnd := PreviewZOrder[i]
+        if (hwnd != exceptHwnd && WinExist("ahk_id " hwnd) && !IsWindowPreviewProtected(hwnd))
+        {
+            try
+                DllCall("user32\SetWindowPos"
+                    , "ptr", hwnd
+                    , "ptr", 0
+                    , "int", 0
+                    , "int", 0
+                    , "int", 0
+                    , "int", 0
+                    , "uint", 0x13)
+        }
+        i--
+    }
+
+    PreviewZOrder := []
+    PreviewShownMinimizedWindows := Map()
+    PreviewCurrentHwnd := 0
+}
+
+; 只管理普通应用窗口，避免影响置顶窗口、贴图窗口、任务栏和桌面。
+IsPreviewManagedWindow(hwnd, allowIconic := false)
+{
+    if (!WinExist("ahk_id " hwnd))
+        return false
+    if (IsWindowPreviewProtected(hwnd))
+        return false
+    if (!DllCall("user32\IsWindowVisible", "ptr", hwnd))
+        return false
+    if (!allowIconic && DllCall("user32\IsIconic", "ptr", hwnd))
+        return false
+    try
+        return IsAltTabCandidate(hwnd, allowIconic)
+    catch
+        return false
+}
+
+IsWindowPreviewProtected(hwnd)
+{
+    global GuiObj
+
+    if (IsObject(GuiObj))
+    {
+        try
+            if (hwnd = GuiObj.Hwnd)
+                return true
+    }
+
+    exStyle := DllCall("user32\GetWindowLongPtr", "ptr", hwnd, "int", -20, "ptr")
+    return (exStyle & 0x8) != 0 ; WS_EX_TOPMOST
 }
 
 ; 清理历史列表中的无效窗口，渲染前和定时刷新都会调用
@@ -613,7 +1022,7 @@ RemoveInvalidWindows()
 }
 
 ; 按 MRU 顺序取 UI 列表，同时分别限制前台/后台数量
-GetDisplayWindows()
+GetDisplayWindows(includeBackgroundFallback := true)
 {
     global WindowHistory, MaxForegroundWindows, MaxBackgroundWindows, BackgroundWindowsAlwaysAtBottom
 
@@ -647,7 +1056,7 @@ GetDisplayWindows()
     }
 
     ; 有些应用托盘化后换隐藏主窗口句柄，只允许“曾经前台出现过”的进程兜底。
-    if (backgroundCount < MaxBackgroundWindows)
+    if (includeBackgroundFallback && backgroundCount < MaxBackgroundWindows)
     {
         for hwnd in EnumWindowsRaw()
         {
@@ -657,7 +1066,7 @@ GetDisplayWindows()
                 continue
             if (ArrayContains(result, hwnd) || ArrayContains(backgroundResult, hwnd))
                 continue
-            if (!IsBackgroundWindow(hwnd) || !IsSeenForegroundProcess(hwnd))
+            if (!IsBackgroundWindow(hwnd) || (!IsSeenForegroundProcess(hwnd) && !IsBackgroundProcessAllowed(hwnd)))
                 continue
             if (!IsAltTabCandidate(hwnd, true))
                 continue
@@ -696,7 +1105,7 @@ GetBestBackgroundWindow(hwnd)
     bestArea := GetWindowArea(hwnd)
     for candidate in EnumWindowsRaw()
     {
-        if (!IsBackgroundWindow(candidate) || !IsSeenForegroundProcess(candidate))
+        if (!IsBackgroundWindow(candidate) || (!IsSeenForegroundProcess(candidate) && !IsBackgroundProcessAllowed(candidate)))
             continue
         try
             candidateExe := WinGetProcessName("ahk_id " candidate)
@@ -741,6 +1150,36 @@ IsSeenForegroundProcess(hwnd)
     return ForegroundProcessSeen.Has(exe)
 }
 
+IsBackgroundProcessAllowed(hwnd)
+{
+    global BackgroundProcessAllowlist
+
+    try
+        exe := WinGetProcessName("ahk_id " hwnd)
+    catch
+        return false
+
+    for item in BackgroundProcessAllowlist
+        if (exe = item)
+            return true
+    return false
+}
+
+IsOwnedWindowProcessAllowed(hwnd)
+{
+    global OwnedWindowProcessAllowlist
+
+    try
+        exe := WinGetProcessName("ahk_id " hwnd)
+    catch
+        return false
+
+    for item in OwnedWindowProcessAllowlist
+        if (exe = item)
+            return true
+    return false
+}
+
 ; UI 最大行数由前台和后台两个上限相加得到
 GetMaxDisplayWindows()
 {
@@ -759,7 +1198,7 @@ IsBackgroundWindow(hwnd)
 ; 创建一次 GUI 和固定行控件，后续只更新文本以减少闪烁
 CreateListGui()
 {
-    global GuiObj, ForegroundProcessControls, BackgroundProcessControls, TitleControls, ArrowControls, UIFontSize, UIRowGap
+    global GuiObj, ForegroundProcessControls, BackgroundProcessControls, IconControls, TitleControls, ArrowControls, UIFontSize, UIRowGap, UIIconSize
     global MaxProcessColumnWidth, TitleColumnWidth
 
     Critical "On"
@@ -771,9 +1210,12 @@ CreateListGui()
     rowStep := rowHeight + UIRowGap
     processWidth := MaxProcessColumnWidth
     titleWidth := TitleColumnWidth
-    titleX := 52 + processWidth
+    iconX := GetIconColumnX()
+    processX := GetProcessColumnX()
+    titleX := processX + processWidth
     ForegroundProcessControls := []
     BackgroundProcessControls := []
+    IconControls := []
     TitleControls := []
     ArrowControls := []
     Loop GetMaxDisplayWindows()
@@ -781,22 +1223,26 @@ CreateListGui()
         y := 8 + (A_Index - 1) * rowStep
         textFontSize := (A_Index = 1) ? Max(1, UIFontSize - 3) : UIFontSize
         arrowY := y - 1
+        iconY := y + Max(0, Floor((rowHeight - UIIconSize) / 2))
         processColor := (A_Index = 1) ? "7A97B8" : "B8D7FF"
         titleColor := (A_Index = 1) ? "B0B0B0" : "FFFFFF"
         textStyle := " +0xC +0x200" ; 单行不换行，并在行高内垂直居中
         GuiObj.SetFont("s" UIFontSize " Norm", "Microsoft YaHei UI")
         arrowCtrl := GuiObj.AddText("x12 y" arrowY " cFFFFFF w24 h" rowHeight " Center +0x200", "")
+        iconCtrl := GuiObj.AddPicture("x" iconX " y" iconY " w" UIIconSize " h" UIIconSize " +Hidden", "")
         GuiObj.SetFont("s" textFontSize " Norm", "Microsoft YaHei UI")
-        foregroundProcessCtrl := GuiObj.AddText("x40 y" y " c" processColor " w" processWidth " h" rowHeight " +Hidden" textStyle, "")
+        foregroundProcessCtrl := GuiObj.AddText("x" processX " y" y " c" processColor " w" processWidth " h" rowHeight " +Hidden" textStyle, "")
         GuiObj.SetFont("s" textFontSize " Norm Italic", "Microsoft YaHei UI")
-        backgroundProcessCtrl := GuiObj.AddText("x40 y" y " c" processColor " w" processWidth " h" rowHeight " +Hidden" textStyle, "")
+        backgroundProcessCtrl := GuiObj.AddText("x" processX " y" y " c" processColor " w" processWidth " h" rowHeight " +Hidden" textStyle, "")
         GuiObj.SetFont("s" textFontSize " Norm", "Microsoft YaHei UI")
         titleCtrl := GuiObj.AddText("x" titleX " y" y " c" titleColor " w" titleWidth " h" rowHeight textStyle, "")
         arrowCtrl.OnEvent("Click", SelectWindowByClick.Bind(A_Index))
+        iconCtrl.OnEvent("Click", SelectWindowByClick.Bind(A_Index))
         foregroundProcessCtrl.OnEvent("Click", SelectWindowByClick.Bind(A_Index))
         backgroundProcessCtrl.OnEvent("Click", SelectWindowByClick.Bind(A_Index))
         titleCtrl.OnEvent("Click", SelectWindowByClick.Bind(A_Index))
         ArrowControls.Push(arrowCtrl)
+        IconControls.Push(iconCtrl)
         ForegroundProcessControls.Push(foregroundProcessCtrl)
         BackgroundProcessControls.Push(backgroundProcessCtrl)
         TitleControls.Push(titleCtrl)
@@ -841,12 +1287,13 @@ RestoreListTopmost(showWindow := false)
 ; 确认 GUI 和固定控件都创建完整，避免快速松开 Alt 时访问半销毁对象
 IsListGuiReady()
 {
-    global GuiObj, ForegroundProcessControls, BackgroundProcessControls, TitleControls, ArrowControls
+    global GuiObj, ForegroundProcessControls, BackgroundProcessControls, IconControls, TitleControls, ArrowControls
 
     maxRows := GetMaxDisplayWindows()
     return IsObject(GuiObj)
         && ForegroundProcessControls.Length >= maxRows
         && BackgroundProcessControls.Length >= maxRows
+        && IconControls.Length >= maxRows
         && TitleControls.Length >= maxRows
         && ArrowControls.Length >= maxRows
 }
@@ -899,7 +1346,7 @@ ActivateSelected()
 ; 关闭列表
 HideList()
 {
-    global GuiObj, ForegroundProcessControls, BackgroundProcessControls, TitleControls, ArrowControls
+    global GuiObj, ForegroundProcessControls, BackgroundProcessControls, IconControls, TitleControls, ArrowControls
     Critical "On"
     if (IsObject(GuiObj))
     {
@@ -917,6 +1364,8 @@ HideList()
                 ForegroundProcessControls[A_Index].Opt("+Hidden")
                 BackgroundProcessControls[A_Index].Text := ""
                 BackgroundProcessControls[A_Index].Opt("+Hidden")
+                IconControls[A_Index].Value := ""
+                IconControls[A_Index].Opt("+Hidden")
                 TitleControls[A_Index].Text := ""
                 TitleControls[A_Index].Opt("+Hidden")
             }
@@ -946,7 +1395,7 @@ HideList()
     {
         program := QuickPrograms[Integer(key)]
         if (!ActivateExistingProgram(program))
-            Run(program)
+            RunQuickProgram(program)
     }
 }
 
@@ -1014,6 +1463,21 @@ ActivateExistingProgram(program)
     return true
 }
 
+; Alt+数字安全启动入口：避免裸 Run("xxx.exe") 解析失败时报错
+RunQuickProgram(program)
+{
+    launchCommand := ResolveQuickLaunchCommand(program)
+    if (launchCommand = "")
+        return false
+
+    try
+        Run(launchCommand)
+    catch
+        return false
+
+    return true
+}
+
 ; 找不到现成窗口时，用这里的命令启动或恢复应用
 ResolveQuickLaunchCommand(program)
 {
@@ -1028,7 +1492,139 @@ ResolveQuickLaunchCommand(program)
             return value
     }
 
+    shortcutPath := FindStartMenuShortcutForProgram(program)
+    if (shortcutPath != "")
+        return shortcutPath
+
     return program
+}
+
+; 在公共/用户开始菜单中按快捷方式目标 exe 匹配程序
+FindStartMenuShortcutForProgram(program)
+{
+    global QuickProgramShortcutCache
+
+    exeName := GetProgramExeName(program)
+    if (exeName = "")
+        return ""
+
+    cacheKey := StrLower(exeName)
+    if (QuickProgramShortcutCache.Has(cacheKey))
+        return QuickProgramShortcutCache[cacheKey]
+
+    roots := [
+        EnvGet("ProgramData") "\Microsoft\Windows\Start Menu\Programs",
+        A_AppData "\Microsoft\Windows\Start Menu\Programs"
+    ]
+
+    for root in roots
+    {
+        if (!DirExist(root))
+            continue
+
+        Loop Files root "\*.lnk", "R"
+        {
+            shortcutPath := A_LoopFileFullPath
+            if (!ShortcutMayReferenceExe(shortcutPath, exeName))
+                continue
+
+            try
+            {
+                FileGetShortcut(shortcutPath, &targetPath)
+                SplitPath(targetPath, &targetExe)
+                if (StrLower(targetExe) = cacheKey)
+                {
+                    QuickProgramShortcutCache[cacheKey] := shortcutPath
+                    return shortcutPath
+                }
+            }
+        }
+    }
+
+    QuickProgramShortcutCache[cacheKey] := ""
+    return ""
+}
+
+; .lnk 是二进制文件，先按 ASCII/UTF-16LE 搜 exe 名，命中后再解析快捷方式
+ShortcutMayReferenceExe(shortcutPath, exeName)
+{
+    try
+        data := FileRead(shortcutPath, "RAW")
+    catch
+        return false
+
+    needle := StrLower(exeName)
+    return BufferContainsAsciiText(data, needle) || BufferContainsUtf16LeText(data, needle)
+}
+
+BufferContainsAsciiText(data, needle)
+{
+    needleLen := StrLen(needle)
+    if (needleLen = 0)
+        return true
+    if (data.Size < needleLen)
+        return false
+
+    maxStart := data.Size - needleLen
+    Loop maxStart + 1
+    {
+        start := A_Index - 1
+        matched := true
+        Loop needleLen
+        {
+            b := NumGet(data, start + A_Index - 1, "UChar")
+            if (b >= 65 && b <= 90)
+                b += 32
+            if (b != Ord(SubStr(needle, A_Index, 1)))
+            {
+                matched := false
+                break
+            }
+        }
+        if (matched)
+            return true
+    }
+
+    return false
+}
+
+BufferContainsUtf16LeText(data, needle)
+{
+    needleLen := StrLen(needle)
+    byteLen := needleLen * 2
+    if (needleLen = 0)
+        return true
+    if (data.Size < byteLen)
+        return false
+
+    maxStart := data.Size - byteLen
+    Loop maxStart + 1
+    {
+        start := A_Index - 1
+        matched := true
+        Loop needleLen
+        {
+            charOffset := start + (A_Index - 1) * 2
+            b := NumGet(data, charOffset, "UChar")
+            high := NumGet(data, charOffset + 1, "UChar")
+            if (high != 0)
+            {
+                matched := false
+                break
+            }
+            if (b >= 65 && b <= 90)
+                b += 32
+            if (b != Ord(SubStr(needle, A_Index, 1)))
+            {
+                matched := false
+                break
+            }
+        }
+        if (matched)
+            return true
+    }
+
+    return false
 }
 
 ; 当前活动窗口属于同一程序时，从它的位置开始轮转

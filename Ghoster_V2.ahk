@@ -9,18 +9,24 @@
 SetWinDelay(0)
 
 ^+x::ToggleMode()
+^!x::ToggleEnabled()
+^+s::ToggleBlankScreen()
 
 applicationname := "Ghoster"
 mainGui := ""
 aboutGui := ""
 guiid := 0
 hCurs := 0
+blankGui := ""
+blankInputHook := ""
+blankScreenActive := false
 oldid := 0
 oldtop := 0
 progmanid := 0
 taskbarid := 0
 secondaryTaskbarIds := []
 dimMode := "window"
+dimEnabled := true
 currentSettings := ""
 monitorGuis := Map()
 
@@ -29,16 +35,24 @@ OnExit(EXIT)
 START()
 
 START() {
-  global applicationname, mainGui, guiid, oldid, oldtop, progmanid, taskbarid, secondaryTaskbarIds, dimMode, currentSettings
+  global applicationname, mainGui, guiid, oldid, oldtop, progmanid, taskbarid, secondaryTaskbarIds, dimMode, dimEnabled, currentSettings
 
   settings := READINI()
   currentSettings := settings
   dimMode := NormalizeMode(settings.mode)
+  dimEnabled := settings.enabled != 0
   if settings.modehotkey != "" && settings.modehotkey != "ERROR" {
     try {
       modehotkey := Trim(settings.modehotkey)
       if modehotkey != "^+x"
         Hotkey(modehotkey, (*) => ToggleMode(), "On")
+    }
+  }
+  if settings.togglehotkey != "" && settings.togglehotkey != "ERROR" {
+    try {
+      togglehotkey := Trim(settings.togglehotkey)
+      if togglehotkey != "^!x"
+        Hotkey(togglehotkey, (*) => ToggleEnabled(), "On")
     }
   }
   TRAYMENU()
@@ -104,12 +118,15 @@ START() {
   settings.desktopw := (desktopw != "" ? desktopw : A_ScreenWidth)
   settings.desktoph := (desktoph != "" ? desktoph : A_ScreenHeight)
 
-  ApplyDimming(oldid, settings)
+  if dimEnabled
+    ApplyDimming(oldid, settings)
+  else
+    HideAllDimming()
   MainLoop(settings)
 }
 
 MainLoop(settings) {
-  global applicationname, guiid, oldid, oldtop, progmanid
+  global applicationname, guiid, oldid, oldtop, progmanid, dimEnabled
 
   oldLButton := GetKeyState("LButton", "P")
   loop {
@@ -122,6 +139,12 @@ MainLoop(settings) {
     clicked := lbutton && !oldLButton
     activeChanged := winid != oldid
     wintop := 0
+
+    if !dimEnabled {
+      oldid := winid
+      oldLButton := lbutton
+      continue
+    }
 
     if IsBlacklistedWindow(winid, settings.blacklist) {
       oldLButton := lbutton
@@ -247,9 +270,13 @@ NormalizeMode(mode) {
 }
 
 ToggleMode(*) {
-  global dimMode, currentSettings, oldid
+  global dimMode, dimEnabled, currentSettings, oldid
 
   dimMode := dimMode = "window" ? "monitor" : "window"
+  if !dimEnabled {
+    ShowStatusTip()
+    return
+  }
   winid := oldid
   try {
     if !WinExist("ahk_id " winid)
@@ -258,14 +285,134 @@ ToggleMode(*) {
     return
   }
   ApplyDimming(winid, currentSettings)
-  ShowModeTip()
+  ShowStatusTip()
 }
 
-ShowModeTip() {
-  global dimMode
+ToggleEnabled(*) {
+  global dimEnabled, currentSettings, oldid
 
-  ToolTip(dimMode = "monitor" ? "Ghoster: monitor mode" : "Ghoster: window mode")
+  dimEnabled := !dimEnabled
+  if !dimEnabled {
+    HideAllDimming()
+    ShowStatusTip()
+    return
+  }
+
+  winid := oldid
+  try {
+    if !WinExist("ahk_id " winid)
+      winid := WinGetID("A")
+  } catch {
+    ShowStatusTip()
+    return
+  }
+  ApplyDimming(winid, currentSettings)
+  ShowStatusTip()
+}
+
+ShowStatusTip() {
+  global dimMode, dimEnabled
+
+  if !dimEnabled
+    text := "Ghoster: off"
+  else
+    text := dimMode = "monitor" ? "Ghoster: monitor mode" : "Ghoster: window mode"
+  ToolTip(text)
   SetTimer(() => ToolTip(), -800)
+}
+
+ToggleBlankScreen(*) {
+  BlankScreen()
+}
+
+BlankScreen(*) {
+  global blankGui, blankInputHook, blankScreenActive
+
+  if blankScreenActive
+    return
+  if IsObject(blankGui) {
+    try
+      blankGui.Destroy()
+  }
+  blankScreenActive := true
+
+  GetVirtualScreenRect(&left, &top, &width, &height)
+  blankGui := Gui("+AlwaysOnTop -Caption +ToolWindow")
+  blankGui.BackColor := "Black"
+  blankGui.Show("NA X" left " Y" top " W" width " H" height)
+  try
+    WinMoveTop("ahk_id " blankGui.Hwnd)
+
+  DllCall("ShowCursor", "Int", 0)
+
+  SetBlankExitHotkeys("On")
+
+  blankInputHook := InputHook("L1")
+  blankInputHook.Start()
+  blankInputHook.Wait()
+  ExitBlank()
+}
+
+ExitBlank(*) {
+  global blankGui, blankInputHook, blankScreenActive
+
+  if !blankScreenActive
+    return
+  blankScreenActive := false
+
+  SetBlankExitHotkeys("Off")
+
+  if IsObject(blankInputHook) {
+    try
+      blankInputHook.Stop()
+  }
+  blankInputHook := ""
+
+  DllCall("ShowCursor", "Int", 1)
+
+  if IsObject(blankGui) {
+    try
+      blankGui.Destroy()
+  }
+  blankGui := ""
+}
+
+SetBlankExitHotkeys(state) {
+  keys := [
+    "LButton",
+    "RButton",
+    "MButton",
+    "*LWin",
+    "*RWin",
+    "*Ctrl",
+    "*LCtrl",
+    "*RCtrl",
+    "*Shift",
+    "*LShift",
+    "*RShift",
+    "*Alt",
+    "*LAlt",
+    "*RAlt",
+    "*Backspace",
+    "*Delete",
+    "*Insert"
+  ]
+
+  for key in keys {
+    try
+      Hotkey(key, ExitBlank, state)
+  }
+}
+
+GetVirtualScreenRect(&left, &top, &width, &height) {
+  left := DllCall("GetSystemMetrics", "Int", 76, "Int")
+  top := DllCall("GetSystemMetrics", "Int", 77, "Int")
+  width := DllCall("GetSystemMetrics", "Int", 78, "Int")
+  height := DllCall("GetSystemMetrics", "Int", 79, "Int")
+  if width <= 0
+    width := A_ScreenWidth
+  if height <= 0
+    height := A_ScreenHeight
 }
 
 ApplyDimming(winid, settings) {
@@ -333,7 +480,15 @@ ApplyMonitorDimming(winid, settings) {
       continue
     seen[index] := true
     if !monitorGuis.Has(index) {
-      MonitorGet(index, &left, &top, &right, &bottom)
+      left := 0
+      top := 0
+      right := 0
+      bottom := 0
+      try {
+        MonitorGet(index, &left, &top, &right, &bottom)
+      } catch {
+        continue
+      }
       gui := Gui("+AlwaysOnTop +ToolWindow -Disabled -SysMenu -Caption +E0x20", applicationname "Monitor" index)
       gui.MarginX := 0
       gui.MarginY := 0
@@ -347,8 +502,14 @@ ApplyMonitorDimming(winid, settings) {
     }
   }
 
-  for index, gui in monitorGuis.Clone() {
-    if !seen.Has(index) {
+  removeIndexes := []
+  for index, gui in monitorGuis {
+    if !seen.Has(index)
+      removeIndexes.Push(index)
+  }
+  for index in removeIndexes {
+    if monitorGuis.Has(index) {
+      gui := monitorGuis[index]
       try
         gui.Destroy()
       monitorGuis.Delete(index)
@@ -357,17 +518,30 @@ ApplyMonitorDimming(winid, settings) {
 }
 
 GetWindowMonitorIndex(winid) {
+  px := 0
+  py := 0
   try {
     WinGetPos(&x, &y, &w, &h, "ahk_id " winid)
     px := x + w // 2
     py := y + h // 2
   } catch {
-    MouseGetPos(&px, &py)
+    try
+      MouseGetPos(&px, &py)
+    catch
+      return MonitorGetPrimary()
   }
 
   count := MonitorGetCount()
   Loop count {
-    MonitorGet(A_Index, &left, &top, &right, &bottom)
+    left := 0
+    top := 0
+    right := 0
+    bottom := 0
+    try {
+      MonitorGet(A_Index, &left, &top, &right, &bottom)
+    } catch {
+      continue
+    }
     if px >= left && px < right && py >= top && py < bottom
       return A_Index
   }
@@ -382,6 +556,16 @@ DestroyMonitorGuis() {
       gui.Destroy()
   }
   monitorGuis := Map()
+}
+
+HideAllDimming() {
+  global mainGui
+
+  DestroyMonitorGuis()
+  if IsObject(mainGui) {
+    try
+      mainGui.Hide()
+  }
 }
 
 READINI() {
@@ -407,6 +591,8 @@ READINI() {
     ini .= "`n`;blacklist=                 Comma-separated process names to ignore. Supports class:NAME and title:TEXT."
     ini .= "`n`;mode=window or monitor     window: current window highlighted, monitor: current monitor highlighted."
     ini .= "`n`;modehotkey=^+x             Hotkey to switch mode. ^ Ctrl, + Shift, ! Alt, # Win."
+    ini .= "`n`;enabled=1 or 0             Enables or disables dimming on startup."
+    ini .= "`n`;togglehotkey=^!x           Hotkey to enable or disable dimming."
     ini .= "`n"
     ini .= "`n[Settings]"
     ini .= "`nbackcolor=000000"
@@ -426,6 +612,8 @@ READINI() {
     ini .= "`nblacklist=TextInputHost.exe,ctfmon.exe,Snipaste.exe,PixPin.exe"
     ini .= "`nmode=window"
     ini .= "`nmodehotkey=^+x"
+    ini .= "`nenabled=1"
+    ini .= "`ntogglehotkey=^!x"
     ini .= "`n"
     FileAppend(ini, iniFile)
   }
@@ -447,7 +635,9 @@ READINI() {
     multimon: IniRead(iniFile, "Settings", "multimon", "ERROR"),
     blacklist: IniRead(iniFile, "Settings", "blacklist", "TextInputHost.exe,ctfmon.exe,Snipaste.exe,PixPin.exe"),
     mode: IniRead(iniFile, "Settings", "mode", "window"),
-    modehotkey: IniRead(iniFile, "Settings", "modehotkey", "^+x")
+    modehotkey: IniRead(iniFile, "Settings", "modehotkey", "^+x"),
+    enabled: IniRead(iniFile, "Settings", "enabled", "1"),
+    togglehotkey: IniRead(iniFile, "Settings", "togglehotkey", "^!x")
   }
 }
 
@@ -484,6 +674,7 @@ TRAYMENU() {
   A_TrayMenu.Add()
   A_TrayMenu.Add("&Settings...", SETTINGS)
   A_TrayMenu.Add("&Toggle Mode", ToggleMode)
+  A_TrayMenu.Add("Toggle &Enabled", ToggleEnabled)
   A_TrayMenu.Add("&About...", ABOUT)
   A_TrayMenu.Add("&Restart", RESTART)
   A_TrayMenu.Add("E&xit", EXIT)
@@ -503,6 +694,7 @@ RESTART(*) {
 DESTROY() {
   global mainGui
 
+  ExitBlank()
   if IsObject(mainGui)
     mainGui.Destroy()
   DestroyMonitorGuis()
