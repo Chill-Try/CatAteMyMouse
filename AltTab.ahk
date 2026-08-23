@@ -144,6 +144,7 @@ QuickProgramShortcutCache := Map() ; exe 名 -> 开始菜单快捷方式路径
 PreviewZOrder := []            ; 进入 Alt+Tab 时普通窗口 Z 序快照
 PreviewTransparentWindows := Map() ; 预览独占模式下被临时透明的窗口
 PreviewShownMinimizedWindows := Map() ; 预览时被临时无激活显示的最小化窗口
+PreviewTopmostWindows := Map() ; 预览时被临时置顶的普通窗口
 PreviewCurrentHwnd := 0        ; 当前预览窗口
 
 ; =====================================================
@@ -491,11 +492,14 @@ FinishSwitching()
         return
 
     selectedHwnd := (Index >= 1 && Index <= DisplayWindows.Length) ? DisplayWindows[Index] : 0
+    HideList()
     RestoreWindowPreview(selectedHwnd)
+    RestorePreviewTopmostInReverse(selectedHwnd)
+    RestoreSelectedPreviewTopmost(selectedHwnd)
     ActivateSelected()
+    ClearPreviewState()
     Switching := false
     DisplayWindowWasBackground := Map()
-    HideList()
     SetTimer(PreCreateListGui, -50)
 }
 
@@ -769,11 +773,12 @@ PruneDisplayWindows()
 ; 记录切换开始时普通窗口的 Z 序，结束前恢复，避免预览过程永久改变其它窗口排列
 CapturePreviewZOrder()
 {
-    global PreviewZOrder, PreviewTransparentWindows, PreviewShownMinimizedWindows, PreviewCurrentHwnd
+    global PreviewZOrder, PreviewTransparentWindows, PreviewShownMinimizedWindows, PreviewTopmostWindows, PreviewCurrentHwnd
 
     PreviewZOrder := []
     PreviewTransparentWindows := Map()
     PreviewShownMinimizedWindows := Map()
+    PreviewTopmostWindows := Map()
     PreviewCurrentHwnd := 0
 
     for hwnd in EnumWindowsRaw()
@@ -783,7 +788,7 @@ CapturePreviewZOrder()
     }
 }
 
-; 将箭头指向窗口展示出来。先无激活抬高，再实际激活，确保窗口可见。
+; 将箭头指向窗口非激活展示出来；最终松开 Alt 时才真正激活目标窗口。
 ApplyWindowPreview()
 {
     global DisplayWindows, Index, PreviewOnlySelectedWindow, PreviewCurrentHwnd, PreviewZOrder
@@ -804,7 +809,6 @@ ApplyWindowPreview()
         RestorePreviewTransparency(hwnd)
 
     ShowPreviewWindow(hwnd)
-    ActivatePreviewWindow(hwnd)
     PreviewCurrentHwnd := hwnd
 }
 
@@ -877,12 +881,12 @@ RestoreOnePreviewTransparency(hwnd)
     PreviewTransparentWindows.Delete(hwnd)
 }
 
-; 尽量不激活地先展示候选窗口，后续再实际激活兜底。
+; 非激活展示候选窗口。最小化窗口只临时显示，未最终选中会恢复最小化。
 ShowPreviewWindow(hwnd)
 {
-    global PreviewShownMinimizedWindows
+    global PreviewShownMinimizedWindows, PreviewTopmostWindows, PreviewCurrentHwnd
 
-    if (IsWindowPreviewProtected(hwnd))
+    if (IsWindowPreviewProtected(hwnd) && !PreviewTopmostWindows.Has(hwnd))
         return
 
     visible := DllCall("user32\IsWindowVisible", "ptr", hwnd)
@@ -897,10 +901,16 @@ ShowPreviewWindow(hwnd)
         DllCall("user32\ShowWindow", "ptr", hwnd, "int", 4) ; SW_SHOWNOACTIVATE
     }
 
-    ; HWND_TOP=0；0x13 = NOSIZE | NOMOVE | NOACTIVATE
+    if (!PreviewTopmostWindows.Has(hwnd))
+        PreviewTopmostWindows[hwnd] := true
+
+    if (hwnd = PreviewCurrentHwnd)
+        return
+
+    ; HWND_TOPMOST=-1；0x13 = NOSIZE | NOMOVE | NOACTIVATE
     DllCall("user32\SetWindowPos"
         , "ptr", hwnd
-        , "ptr", 0
+        , "ptr", -1
         , "int", 0
         , "int", 0
         , "int", 0
@@ -908,33 +918,10 @@ ShowPreviewWindow(hwnd)
         , "uint", 0x13)
 }
 
-; 实际激活候选窗口，保证箭头移动时用户能看到该窗口。
-ActivatePreviewWindow(hwnd)
-{
-    global PreviewCurrentHwnd
-
-    if (hwnd = PreviewCurrentHwnd)
-        return
-    if (IsWindowPreviewProtected(hwnd))
-        return
-
-    visible := DllCall("user32\IsWindowVisible", "ptr", hwnd)
-    iconic := DllCall("user32\IsIconic", "ptr", hwnd)
-    if (!visible && !iconic)
-        return
-
-    try
-    {
-        if (iconic)
-            DllCall("user32\ShowWindow", "ptr", hwnd, "int", 9) ; SW_RESTORE
-        WinActivate("ahk_id " hwnd)
-    }
-}
-
-; 恢复预览造成的透明、最小化和普通窗口 Z 序。最终选中的窗口交给 ActivateWindow 处理。
+; 恢复非最终窗口的预览状态。最终窗口保持当前可见状态，交给最终激活后再取消临时置顶。
 RestoreWindowPreview(exceptHwnd := 0)
 {
-    global PreviewZOrder, PreviewShownMinimizedWindows, PreviewCurrentHwnd
+    global PreviewZOrder, PreviewShownMinimizedWindows, PreviewTopmostWindows, PreviewCurrentHwnd
 
     RestorePreviewTransparency(exceptHwnd)
 
@@ -949,28 +936,62 @@ RestoreWindowPreview(exceptHwnd := 0)
         }
         PreviewShownMinimizedWindows.Delete(hwnd)
     }
+}
+
+RestorePreviewTopmostInReverse(selectedHwnd := 0)
+{
+    global PreviewZOrder, PreviewTopmostWindows
 
     i := PreviewZOrder.Length
     while (i >= 1)
     {
         hwnd := PreviewZOrder[i]
-        if (hwnd != exceptHwnd && WinExist("ahk_id " hwnd) && !IsWindowPreviewProtected(hwnd))
-        {
-            try
-                DllCall("user32\SetWindowPos"
-                    , "ptr", hwnd
-                    , "ptr", 0
-                    , "int", 0
-                    , "int", 0
-                    , "int", 0
-                    , "int", 0
-                    , "uint", 0x13)
-        }
+        if (hwnd != selectedHwnd)
+            RestoreOnePreviewTopmost(hwnd)
         i--
     }
 
+    for hwnd, _ in PreviewTopmostWindows.Clone()
+    {
+        if (hwnd != selectedHwnd)
+            RestoreOnePreviewTopmost(hwnd)
+    }
+}
+
+RestoreSelectedPreviewTopmost(hwnd)
+{
+    RestoreOnePreviewTopmost(hwnd)
+}
+
+RestoreOnePreviewTopmost(hwnd)
+{
+    global PreviewTopmostWindows
+
+    if (!hwnd || !PreviewTopmostWindows.Has(hwnd))
+        return
+
+    if (WinExist("ahk_id " hwnd))
+    {
+        try
+            DllCall("user32\SetWindowPos"
+                , "ptr", hwnd
+                , "ptr", -2       ; HWND_NOTOPMOST
+                , "int", 0
+                , "int", 0
+                , "int", 0
+                , "int", 0
+                , "uint", 0x13)   ; NOSIZE | NOMOVE | NOACTIVATE
+    }
+    PreviewTopmostWindows.Delete(hwnd)
+}
+
+ClearPreviewState()
+{
+    global PreviewZOrder, PreviewShownMinimizedWindows, PreviewTopmostWindows, PreviewCurrentHwnd
+
     PreviewZOrder := []
     PreviewShownMinimizedWindows := Map()
+    PreviewTopmostWindows := Map()
     PreviewCurrentHwnd := 0
 }
 
@@ -1323,24 +1344,25 @@ ActivateSelected()
     global DisplayWindows, Index
 
     if (Index < 1 || Index > DisplayWindows.Length)
-        return
+        return 0
 
     hwnd := DisplayWindows[Index]
     if (!hwnd)
-        return
+        return 0
 
     ; 激活窗口（可能已关闭，try 防抛异常）
     try
     {
         activatedHwnd := ActivateWindow(hwnd)
         if (!activatedHwnd)
-            return
+            return 0
     }
     catch
-        return
+        return 0
 
     ; MRU: 将刚激活的窗口移到列表首位
     PromoteWindow(activatedHwnd)
+    return activatedHwnd
 }
 
 ; 关闭列表
