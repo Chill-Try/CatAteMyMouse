@@ -479,27 +479,7 @@ ApplyMonitorDimming(winid, settings) {
     if index = activeMonitor
       continue
     seen[index] := true
-    if !monitorGuis.Has(index) {
-      left := 0
-      top := 0
-      right := 0
-      bottom := 0
-      try {
-        MonitorGet(index, &left, &top, &right, &bottom)
-      } catch {
-        continue
-      }
-      gui := Gui("+AlwaysOnTop +ToolWindow -Disabled -SysMenu -Caption +E0x20", applicationname "Monitor" index)
-      gui.MarginX := 0
-      gui.MarginY := 0
-      gui.BackColor := settings.backcolor != "" && settings.backcolor != "ERROR" ? settings.backcolor : "000000"
-      gui.Show("NA X" left " Y" top " W" (right - left) " H" (bottom - top))
-      WinSetTransparent(settings.transparency, "ahk_id " gui.Hwnd)
-      monitorGuis[index] := gui
-    } else {
-      try
-        monitorGuis[index].Show("NA")
-    }
+    EnsureMonitorDimGui(index, settings)
   }
 
   removeIndexes := []
@@ -515,6 +495,67 @@ ApplyMonitorDimming(winid, settings) {
       monitorGuis.Delete(index)
     }
   }
+}
+
+EnsureMonitorDimGui(index, settings) {
+  global monitorGuis, applicationname
+
+  left := 0
+  top := 0
+  right := 0
+  bottom := 0
+  try {
+    MonitorGet(index, &left, &top, &right, &bottom)
+  } catch {
+    DestroyMonitorGui(index)
+    return false
+  }
+
+  width := right - left
+  height := bottom - top
+  if width <= 0 || height <= 0 {
+    DestroyMonitorGui(index)
+    return false
+  }
+
+  if monitorGuis.Has(index) {
+    gui := monitorGuis[index]
+    try {
+      gui.Show("NA X" left " Y" top " W" width " H" height)
+      WinMoveTop("ahk_id " gui.Hwnd)
+      return true
+    } catch {
+      DestroyMonitorGui(index)
+    }
+  }
+
+  try {
+    gui := Gui("+AlwaysOnTop +ToolWindow -Disabled -SysMenu -Caption +E0x20", applicationname "Monitor" index)
+    gui.MarginX := 0
+    gui.MarginY := 0
+    gui.BackColor := settings.backcolor != "" && settings.backcolor != "ERROR" ? settings.backcolor : "000000"
+    gui.Show("NA X" left " Y" top " W" width " H" height)
+    WinSetTransparent(settings.transparency, "ahk_id " gui.Hwnd)
+    monitorGuis[index] := gui
+    return true
+  } catch {
+    try {
+      if IsSet(gui) && IsObject(gui)
+        gui.Destroy()
+    }
+    return false
+  }
+}
+
+DestroyMonitorGui(index) {
+  global monitorGuis
+
+  if !monitorGuis.Has(index)
+    return
+  gui := monitorGuis[index]
+  try
+    gui.Destroy()
+  monitorGuis.Delete(index)
 }
 
 GetWindowMonitorIndex(winid) {

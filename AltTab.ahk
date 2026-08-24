@@ -4,6 +4,10 @@ DetectHiddenWindows true
 ; 使用不可见按键屏蔽 Alt 热键释放后的系统菜单激活
 A_MenuMaskKey := "vkE8"
 
+; 按住 Alt+Tab 时会快速重复触发热键，调高 AHK 的热键频率保护阈值以避免弹出终止提示
+A_HotkeyInterval := 2000
+A_MaxHotkeysPerInterval := 1000
+
 ; =====================================================
 ; 配置区域
 ; =====================================================
@@ -495,6 +499,7 @@ FinishSwitching()
     HideList()
     RestoreWindowPreview(selectedHwnd)
     RestorePreviewTopmostInReverse(selectedHwnd)
+    RestoreNonSelectedPreviewZOrder(selectedHwnd)
     RestoreSelectedPreviewTopmost(selectedHwnd)
     ActivateSelected()
     ClearPreviewState()
@@ -955,6 +960,33 @@ RestorePreviewTopmostInReverse(selectedHwnd := 0)
     {
         if (hwnd != selectedHwnd)
             RestoreOnePreviewTopmost(hwnd)
+    }
+}
+
+RestoreNonSelectedPreviewZOrder(selectedHwnd := 0)
+{
+    global PreviewZOrder
+
+    previousHwnd := 0
+    for hwnd in PreviewZOrder
+    {
+        if (hwnd = selectedHwnd)
+            continue
+        if (!WinExist("ahk_id " hwnd) || IsWindowPreviewProtected(hwnd))
+            continue
+
+        insertAfter := previousHwnd ? previousHwnd : 0 ; HWND_TOP for the first non-selected window.
+        try
+            DllCall("user32\SetWindowPos"
+                , "ptr", hwnd
+                , "ptr", insertAfter
+                , "int", 0
+                , "int", 0
+                , "int", 0
+                , "int", 0
+                , "uint", 0x13) ; NOSIZE | NOMOVE | NOACTIVATE
+
+        previousHwnd := hwnd
     }
 }
 
