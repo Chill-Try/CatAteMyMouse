@@ -57,11 +57,11 @@ START() {
   }
   TRAYMENU()
   CoordMode("Mouse", "Screen")
-  progmanid := WinGetID("ahk_class Progman")
-  taskbarid := WinGetID("ahk_class Shell_TrayWnd")
-  secondaryTaskbarIds := WinGetList("ahk_class Shell_SecondaryTrayWnd")
-  oldid := WinGetID("A")
-  oldtop := WinGetExStyle("ahk_id " oldid) & 0x8
+  progmanid := GetWindowIDOrZero("ahk_class Progman")
+  taskbarid := GetWindowIDOrZero("ahk_class Shell_TrayWnd")
+  secondaryTaskbarIds := GetWindowListOrEmpty("ahk_class Shell_SecondaryTrayWnd")
+  oldid := GetWindowIDOrZero("A")
+  oldtop := oldid ? GetWindowTopmostFlag(oldid) : 0
 
   params := ""
   desktopx := 0
@@ -118,7 +118,7 @@ START() {
   settings.desktopw := (desktopw != "" ? desktopw : A_ScreenWidth)
   settings.desktoph := (desktoph != "" ? desktoph : A_ScreenHeight)
 
-  if dimEnabled
+  if dimEnabled && oldid
     ApplyDimming(oldid, settings)
   else
     HideAllDimming()
@@ -269,12 +269,33 @@ NormalizeMode(mode) {
   return mode = "monitor" ? "monitor" : "window"
 }
 
+GetWindowIDOrZero(winTitle) {
+  try
+    return WinGetID(winTitle)
+  catch
+    return 0
+}
+
+GetWindowListOrEmpty(winTitle) {
+  try
+    return WinGetList(winTitle)
+  catch
+    return []
+}
+
+GetWindowTopmostFlag(winid) {
+  try
+    return WinGetExStyle("ahk_id " winid) & 0x8
+  catch
+    return 0
+}
+
 ToggleMode(*) {
   global dimMode, dimEnabled, currentSettings, oldid
 
   dimMode := dimMode = "window" ? "monitor" : "window"
   if !dimEnabled {
-    ShowStatusTip()
+    ShowModeTip()
     return
   }
   winid := oldid
@@ -285,7 +306,7 @@ ToggleMode(*) {
     return
   }
   ApplyDimming(winid, currentSettings)
-  ShowStatusTip()
+  ShowModeTip()
 }
 
 ToggleEnabled(*) {
@@ -294,7 +315,7 @@ ToggleEnabled(*) {
   dimEnabled := !dimEnabled
   if !dimEnabled {
     HideAllDimming()
-    ShowStatusTip()
+    ShowEnabledTip()
     return
   }
 
@@ -303,21 +324,24 @@ ToggleEnabled(*) {
     if !WinExist("ahk_id " winid)
       winid := WinGetID("A")
   } catch {
-    ShowStatusTip()
+    ShowEnabledTip()
     return
   }
   ApplyDimming(winid, currentSettings)
-  ShowStatusTip()
+  ShowEnabledTip()
 }
 
-ShowStatusTip() {
-  global dimMode, dimEnabled
+ShowModeTip() {
+  global dimMode
 
-  if !dimEnabled
-    text := "Ghoster: off"
-  else
-    text := dimMode = "monitor" ? "Ghoster: monitor mode" : "Ghoster: window mode"
-  ToolTip(text)
+  ToolTip(dimMode = "monitor" ? "Ghoster: monitor mode" : "Ghoster: window mode")
+  SetTimer(() => ToolTip(), -800)
+}
+
+ShowEnabledTip() {
+  global dimEnabled
+
+  ToolTip(dimEnabled ? "Ghoster: on" : "Ghoster: off")
   SetTimer(() => ToolTip(), -800)
 }
 

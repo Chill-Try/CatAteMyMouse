@@ -56,6 +56,19 @@ ProcessAliasMap := Map(
 ; 是否启用 Alt+数字快捷启动
 EnableQuickLaunch := true
 
+; 是否启用 Win+M 最大化/还原当前窗口
+EnableWinMaximizeToggle := true
+
+; 按住 Alt 滚轮增强模式："Disable" 禁用，"Multi" 倍数模式，"Steps" 固定滚轮格数模式
+; "Lines" 可作为 "Steps" 的兼容别名；实际行数由 Windows/应用决定，脚本控制的是滚轮格数。
+EnableAltWheelMultiplier := "Multi"
+
+; Alt 滚轮倍数模式倍率，支持 1.3 这类小数倍率
+AltWheelMultiplier := 3.0
+
+; Alt 滚轮固定格数模式：每滚一下发送多少个滚轮格
+AltWheelSteps := 12
+
 ; Alt+数字 快捷程序映射
 QuickPrograms := Map(
     1, "explorer.exe",
@@ -150,6 +163,7 @@ PreviewTransparentWindows := Map() ; 预览独占模式下被临时透明的窗�
 PreviewShownMinimizedWindows := Map() ; 预览时被临时无激活显示的最小化窗口
 PreviewTopmostWindows := Map() ; 预览时被临时置顶的普通窗口
 PreviewCurrentHwnd := 0        ; 当前预览窗口
+AltWheelRemainder := Map("Up", 0.0, "Down", 0.0) ; 小数倍率余量，按方向独立累计
 
 ; =====================================================
 ; 窗口枚举 — WinAPI EnumWindows
@@ -1454,6 +1468,102 @@ HideList()
 }
 
 #HotIf
+
+; =====================================================
+; Win+M — 最大化 / 还原当前窗口
+; =====================================================
+
+#HotIf EnableWinMaximizeToggle
+
+#m::
+{
+    ToggleActiveWindowMaximize()
+}
+
+#HotIf
+
+ToggleActiveWindowMaximize()
+{
+    hwnd := WinExist("A")
+    if (!hwnd)
+        return
+
+    if (WinGetMinMax("ahk_id " hwnd) = 1)
+        WinRestore("ahk_id " hwnd)
+    else
+        WinMaximize("ahk_id " hwnd)
+}
+
+; =====================================================
+; Alt + 滚轮 — 增强滚动
+; =====================================================
+
+#HotIf IsAltWheelMultiplierEnabled()
+
+$!WheelUp::
+{
+    SendAltWheel("Up")
+}
+
+$!WheelDown::
+{
+    SendAltWheel("Down")
+}
+
+#HotIf
+
+IsAltWheelMultiplierEnabled()
+{
+    global EnableAltWheelMultiplier
+    return StrLower(EnableAltWheelMultiplier) != "disable"
+}
+
+SendAltWheel(direction)
+{
+    global EnableAltWheelMultiplier, AltWheelSteps
+
+    mode := StrLower(EnableAltWheelMultiplier)
+    if (mode = "multi" || mode = "multiply")
+        count := GetAltWheelMultiplierCount(direction)
+    else if (mode = "steps" || mode = "lines")
+        count := GetPositiveIntegerOrDefault(AltWheelSteps, 1)
+    else
+        return
+
+    Send("{Wheel" direction " " count "}")
+}
+
+GetAltWheelMultiplierCount(direction)
+{
+    global AltWheelMultiplier, AltWheelRemainder
+
+    try
+        multiplier := Number(AltWheelMultiplier)
+    catch
+        multiplier := 1.0
+
+    if (multiplier <= 0)
+        multiplier := 1.0
+
+    if (!AltWheelRemainder.Has(direction))
+        AltWheelRemainder[direction] := 0.0
+
+    AltWheelRemainder[direction] += multiplier
+    count := Floor(AltWheelRemainder[direction])
+    AltWheelRemainder[direction] -= count
+
+    return Max(count, 1)
+}
+
+GetPositiveIntegerOrDefault(value, defaultValue)
+{
+    try
+        result := Integer(value)
+    catch
+        result := defaultValue
+
+    return Max(result, 1)
+}
 
 ; Alt+数字：优先激活已有窗口，多个同进程窗口按上次位置轮转
 ActivateExistingProgram(program)
